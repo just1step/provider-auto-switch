@@ -1,403 +1,436 @@
-"""provider-auto-switch — Core switching engine.
+"""provider-auto-switch: Priority resolution engine.
 
-Provider scanning, matching algorithm, and switch execution via
-hermes_cli.model_switch.switch_model().
+Core concepts:
+- Two independent priority dimensions: models × providers
+- Per-model provider overrides (model_providers) — each model can have its own
+  provider priority list; unspecified models fall back to global provider_priority
+- Per-provider model overrides (provider_models) — each provider can have its own
+  model priority list; unspecified providers fall back to global model_priority
+- Two-pass sorting: active combos first, limited as last resort
+- Combo existence checked against scan snapshot data (not hardcoded)
 """
+
 from __future__ import annotations
 
-import json
-import logging
-import os
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Optional
-
-import yaml
-import requests
+from typing import Optional
 
 from auto_switch_db import (
-    ScanSnapshot, SwitchConfig, SwitchHistory,
-    upsert_snapshot, clear_snapshots, get_snapshots,
-    get_config, upsert_config, get_active_combo, set_active_combo,
-    add_history, list_profiles_from_config, get_all_configs,
-    init_db,
+    SwitchConfig,
+    ScanEntry,
+    add_history,
+    get_active_combo,
+    get_snapshot,
+    set_active_combo,
+    SwitchHistoryEntry,
 )
 
-log = logging.getLogger(__name__)
 
-# How long to wait before checking a failed model again (seconds)
-RECOVERY_CHECK_INTERVAL = 1800  # 30 minutes
+def _get_providers_for_model(model: str, cfg: SwitchConfig) -> list[str]:
+    """Provider priority for a specific model.
 
-# HTTP request timeout for provider API calls
-PROVIDER_API_TIMEOUT = 10
-
-
-# ---------------------------------------------------------------------------
-# Provider scanning
-# ---------------------------------------------------------------------------
-
-def _load_profile_config(profile_name: str) -> dict:
-    """Load a profile's config.yaml and return its model section + providers."""
-    hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-    cfg_path = hermes_home / "profiles" / profile_name / "config.yaml"
-    if not cfg_path.exists():
-        cfg_path = hermes_home / "config.yaml"  # default profile fallback
-    if not cfg_path.exists():
-        return {}
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f) or {}
-    return cfg
-
-
-def _get_provider_base_url(provider: str, profile_cfg: dict) -> Optional[str]:
-    """Resolve the base URL for a provider from config."""
-    # 1. Check custom_providers
-    custom = profile_cfg.get("custom_providers", [])
-    if isinstance(custom, list):
-        for cp in custom:
-            if isinstance(cp, dict) and cp.get("name") == provider:
-                return cp.get("base_url", "").rstrip("/")
-    # 2. Check providers dict
-    provs = profile_cfg.get("providers", {})
-    if isinstance(provs, dict) and provider in provs:
-        pdef = provs[provider]
-        if isinstance(pdef, dict):
-            return pdef.get("base_url", "").rstrip("/")
-    # 3. Known built-in providers
-    BUILTIN = {
-        "opencode-zen": "https://opencode.ai/zen/v1",
-        "opencode-go": "https://opencode.ai/zen/go/v1",
-        "opencode": "https://opencode.ai/zen/v1",
-        "deepseek": "https://api.deepseek.com",
-        "openai-codex": None,  # no public /v1/models endpoint
-        "openrouter": "https://openrouter.ai/api/v1",
-    }
-    return BUILTIN.get(provider)
-
-
-def _discover_providers(profile_name: str) -> list[dict]:
-    """Discover providers and their models for a profile.
-
-    Returns list of {provider, model, base_url}.
+    Uses per-model override if available; otherwise falls back to global
+    provider_priority. This is the generic mechanism — no model names are
+    hardcoded, so it works with any provider/model combination.
     """
-    cfg = _load_profile_config(profile_name)
+    if cfg.model_providers and model in cfg.model_providers:
+        return cfg.model_providers[model]
+    return cfg.provider_priority
+
+
+def _get_models_for_provider(provider: str, cfg: SwitchConfig) -> list[str]:
+    """Model priority for a specific provider.
+
+    Uses per-provider override if available; otherwise falls back to global
+    model_priority. Generic — works with any provider/model combination.
+    """
+    if cfg.provider_models and provider in cfg.provider_models:
+        return cfg.provider_models[provider]
+    return cfg.model_priority
+
+
+def _combo_exists(model: str, provider: str, provider_models_set: dict[str, set[str]]) -> bool:
+    """True if the model was found on this provider during the last scan.
+
+    Uses scan data only — if the provider doesn't serve this model according
+    to the snapshot, it's treated as non-existent and skipped. No fallback.
+    """
+    return model in provider_models_set.get(provider, set())
+
+
+def find_next_combo(cfg: SwitchConfig, snaps: list[ScanEntry]) -> Optional[tuple[str, str]]:
+    """Two-pass priority resolution.
+
+    Pass 1 (active): Returns the highest-priority combo with status 'active'.
+    Pass 2 (limited): If no active combo exists, returns the highest-priority
+                      combo with status 'limited' (rate-limited, quota-hit).
+
+    Returns None when no combo is usable at all.
+
+    Generic algorithm — driven entirely by config lists:
+    - model_priority / provider_priority (global)
+    - model_providers (per-model overrides)
+    - provider_models (per-provider overrides)
+    - scan_snapshot data (combo existence check)
+    """
+    if not cfg.model_priority or not cfg.provider_priority:
+        return None
+
+    # Build lookup maps from scan snapshots
+    combo_status: dict[tuple[str, str], str] = {}
+    provider_models_set: dict[str, set[str]] = {}
+    for s in snaps:
+        combo_status[(s.model_name, s.provider_name)] = s.status
+        provider_models_set.setdefault(s.provider_name, set()).add(s.model_name)
+
+    if cfg.strategy == "model_first":
+        return _resolve_model_first(cfg, combo_status, provider_models_set)
+    else:
+        return _resolve_provider_first(cfg, combo_status, provider_models_set)
+
+
+def _resolve_model_first(
+    cfg: SwitchConfig,
+    combo_status: dict[tuple[str, str], str],
+    provider_models_set: dict[str, set[str]],
+) -> Optional[tuple[str, str]]:
+    """Model-first resolution with two-pass (active → limited).
+
+    For each model (in priority order), iterate its provider list (using
+    per-model override if available, otherwise global) and find the first
+    active combo. If none, repeat the same traversal looking for limited.
+    """
+    # Pass 1: active only
+    for model in cfg.model_priority:
+        providers = _get_providers_for_model(model, cfg)
+        for provider in providers:
+            if not _combo_exists(model, provider, provider_models_set):
+                continue  # skip — this provider doesn't serve this model
+            if combo_status.get((model, provider)) == "active":
+                return (model, provider)
+    # Pass 2: limited as last resort
+    for model in cfg.model_priority:
+        providers = _get_providers_for_model(model, cfg)
+        for provider in providers:
+            if not _combo_exists(model, provider, provider_models_set):
+                continue
+            if combo_status.get((model, provider)) == "limited":
+                return (model, provider)
+    return None
+
+
+def _resolve_provider_first(
+    cfg: SwitchConfig,
+    combo_status: dict[tuple[str, str], str],
+    provider_models_set: dict[str, set[str]],
+) -> Optional[tuple[str, str]]:
+    """Provider-first resolution with two-pass (active → limited).
+
+    For each provider (in priority order), iterate its model list (using
+    per-provider override if available, otherwise global) and find the first
+    active combo. If none, repeat looking for limited.
+    """
+    # Pass 1: active only
+    for provider in cfg.provider_priority:
+        models = _get_models_for_provider(provider, cfg)
+        for model in models:
+            if not _combo_exists(model, provider, provider_models_set):
+                continue
+            if combo_status.get((model, provider)) == "active":
+                return (model, provider)
+    # Pass 2: limited as last resort
+    for provider in cfg.provider_priority:
+        models = _get_models_for_provider(provider, cfg)
+        for model in models:
+            if not _combo_exists(model, provider, provider_models_set):
+                continue
+            if combo_status.get((model, provider)) == "limited":
+                return (model, provider)
+    return None
+
+
+def auto_switch(
+    profile: str,
+    cfg: SwitchConfig,
+    snaps: list[ScanEntry],
+    reason: str = "auto",
+    triggered_by: str = "auto",
+) -> Optional[dict]:
+    """Execute auto-switch logic for a profile.
+
+    Returns a dict describing the switch if one occurred, or None if no
+    switch was needed/possible.
+
+    Args:
+        profile: Profile name
+        cfg: Switch config for this profile
+        snaps: Current scan snapshot entries
+        reason: Why the switch was triggered (quota_limit, rate_limit, etc.)
+        triggered_by: Who triggered it (auto, manual, scheduler)
+    """
+    if cfg.manual_override:
+        return None  # User is in control
+
+    # Get current active combo
+    current = get_active_combo(profile)
+    current_model = current.model_name if current else ""
+    current_provider = current.provider_name if current else ""
+
+    # Find the best available combo
+    target = find_next_combo(cfg, snaps)
+    if target is None:
+        return {"switched": False, "reason": "No usable combo found"}
+
+    new_model, new_provider = target
+
+    # If same as current, nothing to do
+    if new_model == current_model and new_provider == current_provider:
+        return {"switched": False, "reason": "Already on best combo"}
+
+    # Execute switch (in v1, just record — actual switch_model is called by caller)
+    set_active_combo(profile, new_model, new_provider)
+
+    # Record history
+    add_history(SwitchHistoryEntry(
+        profile_name=profile,
+        from_model=current_model,
+        from_provider=current_provider,
+        to_model=new_model,
+        to_provider=new_provider,
+        reason=reason,
+        triggered_by=triggered_by,
+    ))
+
+    return {
+        "switched": True,
+        "from_model": current_model,
+        "from_provider": current_provider,
+        "to_model": new_model,
+        "to_provider": new_provider,
+        "reason": reason,
+    }
+
+
+def check_recovery(
+    profile: str,
+    cfg: SwitchConfig,
+    snaps: list[ScanEntry],
+) -> Optional[dict]:
+    """Check if a higher-priority combo has become available again.
+
+    Called periodically (via cron or manual) after a switch.
+    If a better combo (higher in priority order) is now active,
+    returns the switch info. Otherwise returns None.
+    """
+    best = find_next_combo(cfg, snaps)
+    if best is None:
+        return None
+
+    current = get_active_combo(profile)
+    if current is None:
+        return None
+
+    # Is the best combo different from AND better than the current one?
+    if best[0] == current.model_name and best[1] == current.provider_name:
+        return None  # Already on best
+
+    # It's better — switch back
+    return auto_switch(
+        profile, cfg, snaps,
+        reason="recovery",
+        triggered_by="scheduler",
+    )
+
+
+def _scan_provider_models(profile_name: str) -> dict[str, list[str]]:
+    """Discover available models from profile's configured providers.
+
+    For each provider defined in the profile's config, calls its
+    /v1/models endpoint (OpenAI-compatible) to get the model list.
+
+    Returns {provider_name: [model1, model2, ...]}.
+    Falls back to the configured model if the API call fails.
+    """
+    import requests
+    import yaml
+    from pathlib import Path
+
+    # Discover profile config
+    hermes_home = Path.home() / ".hermes"
+    if profile_name == "default":
+        config_path = hermes_home / "config.yaml"
+    else:
+        config_path = hermes_home / "profiles" / profile_name / "config.yaml"
+
+    if not config_path.exists():
+        return {}
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f) or {}
+
+    result: dict[str, list[str]] = {}
+
+    # 1. Built-in providers from the model config
     model_cfg = cfg.get("model", {})
-    current_provider = model_cfg.get("provider", "")
-    current_model = model_cfg.get("default", "")
-    custom_provs = cfg.get("custom_providers", [])
+    provider = model_cfg.get("provider", "")
+    base_url = model_cfg.get("base_url", "")
+    default_model = model_cfg.get("default", "")
 
-    # Collect all providers this profile might use
-    providers_to_check = set()
-    providers_to_check.add(current_provider)
+    # Try scanning the current provider
+    if provider and base_url:
+        try:
+            url = f"{base_url.rstrip('/')}/models"
+            resp = requests.get(url, timeout=10)
+            if resp.ok:
+                data = resp.json()
+                models = [m["id"] for m in data.get("data", [])]
+                if models:
+                    result[provider] = models
+        except Exception:
+            pass
 
-    # Add providers from custom_providers
-    if isinstance(custom_provs, list):
-        for cp in custom_provs:
-            if isinstance(cp, dict):
-                providers_to_check.add(cp.get("name", ""))
+    # 2. Custom providers
+    for cp in cfg.get("custom_providers", []):
+        name = cp.get("name", "")
+        url = cp.get("base_url", "")
+        api_key = cp.get("api_key", "")
+        if name and url:
+            try:
+                headers = {}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                resp = requests.get(f"{url.rstrip('/')}/models",
+                                    headers=headers, timeout=10)
+                if resp.ok:
+                    data = resp.json()
+                    models = [m["id"] for m in data.get("data", [])]
+                    if models:
+                        result[name] = models
+            except Exception:
+                # Fallback: just use the configured model
+                fallback = cp.get("model", "")
+                if fallback and name:
+                    result[name] = [fallback]
 
-    # Add providers from switch_config
-    sc = get_config(profile_name)
-    if sc:
-        providers_to_check.update(sc.provider_priority)
+    # 3. If no providers scanned, try known Hermes providers
+    if not result:
+        known = {
+            "opencode-zen": "https://opencode.ai/zen/v1",
+            "opencode-go": "https://opencode.ai/zen/go/v1",
+            "deepseek": "https://api.deepseek.com",
+        }
+        for pname, purl in known.items():
+            try:
+                resp = requests.get(f"{purl}/models", timeout=10)
+                if resp.ok:
+                    data = resp.json()
+                    models = [m["id"] for m in data.get("data", [])]
+                    if models:
+                        result[pname] = models
+            except Exception:
+                pass
 
-    # Add other known built-in providers
-    providers_to_check.update(["opencode-zen", "opencode-go", "deepseek"])
-
-    result = []
-    for provider in sorted(providers_to_check):
-        if not provider:
-            continue
-        base_url = _get_provider_base_url(provider, cfg)
-        if not base_url:
-            log.warning("No base_url for provider '%s' (profile %s)", provider, profile_name)
-            result.append({"provider": provider, "models": [], "base_url": ""})
-            continue
-        models = _fetch_models(provider, base_url)
-        result.append({"provider": provider, "models": models, "base_url": base_url})
+    # 4. Always include the default model as fallback
+    if default_model and provider:
+        if provider not in result or default_model not in result.get(provider, []):
+            result.setdefault(provider, []).append(default_model)
 
     return result
 
 
-def _fetch_models(provider: str, base_url: str) -> list[str]:
-    """Call GET {base_url}/models to discover available model names.
+ERROR_PATTERNS = {
+    "quota_limit": [
+        "usage limit", "quota", "limit reached", "insufficient balance",
+        "GoUsageLimitError", "billing", "exceeded your",
+    ],
+    "rate_limit": [
+        "429", "rate limit", "too many requests", "retry after",
+        "rate_limit", "rate_limited",
+    ],
+    "service_error": [
+        "503", "502", "service unavailable", "overloaded",
+        "internal server error", "bad gateway",
+    ],
+    "auth_error": [
+        "401", "unauthorized", "invalid api key", "authentication",
+    ],
+    "connection_error": [
+        "connection error", "connection refused", "timeout",
+        "name or service not known", "dns", "resolve",
+    ],
+}
 
-    Returns list of model ID strings, or empty on failure.
+
+def _detect_error_type(error_str: str) -> str:
+    """Detect error category from the error message string."""
+    error_lower = error_str.lower()
+    for etype, patterns in ERROR_PATTERNS.items():
+        for pat in patterns:
+            if pat.lower() in error_lower:
+                return etype
+    return "unknown"
+
+
+def handle_api_error(
+    profile_name: str,
+    provider: str,
+    model: str,
+    error_str: str,
+) -> dict:
+    """Handle an API error detected by the post_api_request hook.
+
+    1. Detects error type (quota, rate limit, etc.)
+    2. Marks the current combo as limited in the snapshot
+    3. Finds the next best combo via auto_switch()
+    4. Returns result dict with 'success' key
+
+    Returns:
+        {"success": True, "switched": True, "to_model": ..., ...} on switch
+        {"success": False, "reason": "..."} on failure/no switch needed
     """
-    url = f"{base_url}/models"
-    try:
-        resp = requests.get(url, timeout=PROVIDER_API_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data.get("data", [])
-        if isinstance(raw, list):
-            return sorted(set(
-                m.get("id", "") for m in raw if isinstance(m, dict)
-            ))
-        elif isinstance(raw, dict):
-            # Some providers return a dict keyed by model name
-            return sorted(raw.keys())
-    except requests.RequestException as e:
-        log.warning("Failed to scan %s %s: %s", provider, url, e)
-    except (ValueError, TypeError) as e:
-        log.warning("Failed to parse model list from %s: %s", provider, e)
-    return []
+    from auto_switch_db import (
+        get_config, get_snapshot, upsert_snapshot, ScanEntry,
+    )
 
+    cfg = get_config(profile_name)
+    if cfg is None:
+        return {"success": False, "reason": "No config for profile"}
+    if cfg.manual_override:
+        return {"success": False, "reason": "Manual override active"}
 
-def scan_provider_models(profile_name: str) -> dict:
-    """Scan all providers for a profile and update the snapshot table.
+    # Mark the current combo as limited in snapshot
+    error_type = _detect_error_type(error_str)
 
-    Returns summary dict.
-    """
-    discovered = _discover_providers(profile_name)
-    clear_snapshots(profile_name)
+    # Update snapshot: mark this combo as limited
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    cooldown = timedelta(minutes=5)  # 5 minute cooldown for rate-limited
 
-    model_set = set()
-    stats = {"active": 0, "unavailable": 0, "total": 0, "providers": []}
-
-    for entry in discovered:
-        provider = entry["provider"]
-        models = entry["models"]
-        stats["providers"].append({"name": provider, "count": len(models)})
-
-        if not models:
-            # Provider unreachable — mark all previously known models as unavailable
-            pass
-
-        for model in models:
-            # Check if this model is known to be limited/unavailable
-            prev = get_active_combo(profile_name)
-            snap = ScanSnapshot(
+    if error_type in ("quota_limit", "rate_limit"):
+        upsert_snapshot(profile_name, [
+            ScanEntry(
                 profile_name=profile_name,
                 model_name=model,
                 provider_name=provider,
-                status="active",
-                last_available_at=datetime.utcnow().isoformat(),
+                status="limited",
+                last_available_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                next_check_at=(now + cooldown).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                error_reason=error_type,
             )
-            upsert_snapshot(snap)
-            model_set.add(model)
-            stats["active"] += 1
-            stats["total"] += 1
+        ])
 
-    return stats
+    # Read snapshot and try to switch
+    snaps = get_snapshot(profile_name)
+    result = auto_switch(profile_name, cfg, snaps, reason=error_type, triggered_by="auto")
 
+    if result and result.get("switched"):
+        return {
+            "success": True,
+            "switched": True,
+            "to_model": result.get("to_model"),
+            "to_provider": result.get("to_provider"),
+            "from_model": result.get("from_model"),
+            "from_provider": result.get("from_provider"),
+            "reason": error_type,
+        }
 
-# ---------------------------------------------------------------------------
-# Matching algorithm
-# ---------------------------------------------------------------------------
-
-def _find_next_combo(profile_name: str, cfg: SwitchConfig) -> Optional[tuple[str, str]]:
-    """Find the next active model+provider combo per the strategy.
-
-    Returns (model_name, provider_name) or None if none available.
-    """
-    snaps = get_snapshots(profile_name)
-    # Build lookup: (model, provider) -> status
-    lookup = {}
-    for s in snaps:
-        lookup[(s.model_name, s.provider_name)] = s.status
-
-    # Build set of which models each provider supports
-    provider_models: dict[str, set[str]] = {}
-    model_providers: dict[str, set[str]] = {}
-    for s in snaps:
-        provider_models.setdefault(s.provider_name, set()).add(s.model_name)
-        model_providers.setdefault(s.model_name, set()).add(s.provider_name)
-
-    if cfg.strategy == "model_first":
-        for model in cfg.model_priority:
-            for provider in cfg.provider_priority:
-                status = lookup.get((model, provider), "unavailable")
-                if status == "active" or status == "limited":
-                    return (model, provider)
-        # Fallback: try second model with all providers
-        for model in cfg.model_priority[1:]:
-            for provider in cfg.provider_priority:
-                status = lookup.get((model, provider), "unavailable")
-                if status == "active":
-                    return (model, provider)
-    else:
-        # provider_first
-        for provider in cfg.provider_priority:
-            for model in cfg.model_priority:
-                status = lookup.get((model, provider), "unavailable")
-                if status == "active" or status == "limited":
-                    return (model, provider)
-        for provider in cfg.provider_priority[1:]:
-            for model in cfg.model_priority:
-                status = lookup.get((model, provider), "unavailable")
-                if status == "active":
-                    return (model, provider)
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Switch execution
-# ---------------------------------------------------------------------------
-
-def execute_switch(
-    profile_name: str,
-    target_model: str,
-    target_provider: str,
-    reason: str = "auto",
-    triggered_by: str = "auto",
-) -> dict:
-    """Execute a model switch using hermes_cli.model_switch.switch_model().
-
-    Returns result dict with success/error.
-    """
-    try:
-        from hermes_cli.model_switch import switch_model
-        from hermes_cli.config import get_compatible_custom_providers
-
-        cfg = _load_profile_config(profile_name)
-        model_cfg = cfg.get("model", {})
-        current_model = model_cfg.get("default", "")
-        current_provider = model_cfg.get("provider", "")
-        current_base_url = model_cfg.get("base_url", "")
-        current_api_key = model_cfg.get("api_key", "")
-        custom_provs = get_compatible_custom_providers(cfg)
-
-        result = switch_model(
-            raw_input=target_model,
-            current_provider=current_provider,
-            current_model=current_model,
-            current_base_url=current_base_url,
-            current_api_key=current_api_key,
-            is_global=True,
-            explicit_provider=target_provider,
-            user_providers=cfg.get("providers"),
-            custom_providers=custom_provs,
-        )
-
-        if result.success:
-            set_active_combo(profile_name, target_model, target_provider)
-            h = SwitchHistory(
-                profile_name=profile_name,
-                from_model=current_model,
-                from_provider=current_provider,
-                to_model=target_model,
-                to_provider=target_provider,
-                reason=reason,
-                triggered_by=triggered_by,
-            )
-            add_history(h)
-            log.info("Switched %s: %s/%s -> %s/%s (%s)",
-                      profile_name, current_provider, current_model,
-                      target_provider, target_model, reason)
-            return {"success": True, "from": {"model": current_model, "provider": current_provider},
-                    "to": {"model": target_model, "provider": target_provider}, "reason": reason}
-        else:
-            log.error("Switch failed for %s: %s", profile_name, result.error_message)
-            return {"success": False, "error": result.error_message}
-
-    except ImportError as e:
-        log.error("Cannot import switch_model: %s", e)
-        return {"success": False, "error": f"Import error: {e}"}
-    except Exception as e:
-        log.error("Switch failed: %s", e)
-        return {"success": False, "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Auto-switch trigger
-# ---------------------------------------------------------------------------
-
-def auto_switch(profile_name: str, reason: str = "auto", triggered_by: str = "auto") -> dict:
-    """Check if a profile needs switching, and execute if needed.
-
-    Returns result dict.
-    """
-    cfg = get_config(profile_name)
-    if not cfg:
-        # Auto-create default config for this profile
-        cfg = SwitchConfig(profile_name=profile_name)
-        upsert_config(cfg)
-
-    if cfg.manual_override:
-        log.info("Skip auto-switch for %s: manual override active", profile_name)
-        return {"success": False, "reason": "manual_override"}
-
-    if not cfg.auto_switch:
-        log.info("Skip auto-switch for %s: auto-switch disabled", profile_name)
-        return {"success": False, "reason": "auto_switch_disabled"}
-
-    # Use existing snapshot data — don't call any provider API (zero token cost)
-    combo = _find_next_combo(profile_name, cfg)
-    if not combo:
-        log.warning("No available combo for %s", profile_name)
-        return {"success": False, "reason": "no_available_combo"}
-
-    target_model, target_provider = combo
-    current = get_active_combo(profile_name)
-
-    if current and current["model_name"] == target_model and current["provider_name"] == target_provider:
-        return {"success": True, "reason": "already_active", "combo": combo}
-
-    return execute_switch(profile_name, target_model, target_provider, reason, triggered_by)
-
-
-# ---------------------------------------------------------------------------
-# Recovery detection
-# ---------------------------------------------------------------------------
-
-def check_recovery(profile_name: str) -> dict:
-    """Check if previously failed models/providers have recovered.
-
-    Returns list of recovered items.
-    """
-    cfg = get_config(profile_name)
-    if not cfg:
-        return {"recovered": []}
-
-    # Re-scan providers
-    scan_provider_models(profile_name)
-    combo = _find_next_combo(profile_name, cfg)
-
-    current = get_active_combo(profile_name)
-    if combo and current:
-        target_model, target_provider = combo
-        if target_model != current["model_name"] or target_provider != current["provider_name"]:
-            # Better option available — switch back
-            result = execute_switch(profile_name, target_model, target_provider, "recovery", "scheduler")
-            return {"recovered": [{"model": target_model, "provider": target_provider}], "switch_result": result}
-
-    return {"recovered": []}
-
-
-# ---------------------------------------------------------------------------
-# Error trigger from hooks
-# ---------------------------------------------------------------------------
-
-def handle_api_error(profile_name: str, provider: str, model: str, error_str: str) -> Optional[dict]:
-    """Handle an API error from the post_api_request hook.
-
-    Marks the model/provider as limited/unavailable and triggers auto-switch.
-    """
-    # Determine reason
-    reason = "unknown"
-    el = error_str.lower()
-    if "gousagelimiterror" in el or "quota" in el or "usage limit" in el or "limit reached" in el:
-        reason = "quota_limit"
-    elif "429" in el or "rate limit" in el or "too many requests" in el or "retry after" in el:
-        reason = "rate_limit"
-    elif "503" in el or "502" in el or "service unavailable" in el or "overloaded" in el:
-        reason = "service_error"
-    elif "connectionerror" in el or "timeout" in el or "connection refused" in el:
-        reason = "connection_error"
-
-    # Mark in snapshot
-    snap = ScanSnapshot(
-        profile_name=profile_name,
-        model_name=model,
-        provider_name=provider,
-        status="limited" if reason in ("quota_limit", "rate_limit") else "unavailable",
-        next_check_at=(datetime.utcnow() + timedelta(seconds=RECOVERY_CHECK_INTERVAL)).isoformat(),
-        error_reason=reason,
-    )
-    upsert_snapshot(snap)
-
-    # Trigger auto-switch
-    return auto_switch(profile_name, reason, "auto")
+    return {"success": False, "reason": result.get("reason", "No switch needed") if result else "Unknown"}

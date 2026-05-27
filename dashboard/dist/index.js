@@ -41,6 +41,9 @@
     const token = window.__HERMES_SESSION_TOKEN__ || "";
     const headers = { ...((options && options.headers) || {}) };
     if (token) headers["X-Hermes-Session-Token"] = token;
+    if (options && options.body && typeof options.body === 'string') {
+      headers["Content-Type"] = "application/json";
+    }
     const res = await fetch(url, { ...(options || {}), headers });
     if (!res.ok) {
       const text = await res.text().catch(function () { return res.statusText; });
@@ -68,9 +71,8 @@
     if (!stats) return null;
     const items = [
       { label: "Profiles", value: stats.total_profiles, color: "#7aa2f7" },
-      { label: "Auto", value: stats.auto_switch_enabled, color: "#9ece6a" },
-      { label: "Manual", value: stats.manual_override_active, color: "#e0af68" },
-      { label: "Unhealthy", value: stats.unhealthy, color: "#f7768e" },
+      { label: "Auto", value: stats.auto_switch_on, color: "#9ece6a" },
+      { label: "Manual", value: stats.manual_override, color: "#e0af68" },
     ];
     return h(Card, { style: { marginBottom: "12px" } },
       h(CardContent, { className: "psw-stats" },
@@ -97,36 +99,36 @@
       style: {
         borderLeftColor: isSelected ? "#7aa2f7" : "transparent",
         backgroundColor: isSelected ? "rgba(122,162,247,0.08)" : "transparent",
+        padding: "8px 12px", cursor: "pointer",
+        display: "flex", alignItems: "center", gap: "8px",
       },
     }, [
-      h("div", { className: "psw-profile-name" }, profile.profile_name),
-      h("div", { className: "psw-profile-model" }, [
-        combo
-          ? [h("span", { className: "psw-profile-model-name" }, combo.model_name),
-             h("span", { className: "psw-profile-model-provider" }, combo.provider_name)]
-          : h("span", { style: { fontSize: "12px", color: "#565f89" } }, "Not configured"),
-      ]),
-      h(StatusBadge, { status: status, label: combo ? "Active" : "Inactive" }),
-      h("span", { className: "psw-profile-arrow" }, isSelected ? "\u25B2" : "\u25BC"),
+      h("span", { style: { fontWeight: 600, fontSize: "13px", color: "#c0caf5", flex: 1 } }, profile.profile_name),
+      h(StatusBadge, { status: status, label: combo ? "active" : "n/a" }),
+      h("span", { style: { color: "#565f89", fontSize: "10px" } }, isSelected ? "\u25B2" : "\u25BC"),
     ]);
   }
 
   // -----------------------------------------------------------------------
   // ConfigPanel
   // -----------------------------------------------------------------------
-  function ConfigPanel({ profile, config, onUpdate, onScan, snapshot, loading }) {
+  function ConfigPanel({ profile, config, snapshot, activeCombo, manualOverrideEn, isAutoEnabled, onUpdate, loading }) {
     if (!config) return h("div", { style: { padding: "24px", textAlign: "center", color: "#565f89" } }, "No config yet — config will be auto-created on first use.");
 
     const [strategy, setStrategy] = React.useState(config.strategy);
     const [autoSwitch, setAutoSwitch] = React.useState(config.auto_switch);
     const [modelPrio, setModelPrio] = React.useState(config.model_priority || []);
     const [providerPrio, setProviderPrio] = React.useState(config.provider_priority || []);
+    const [modelProviders, setModelProviders] = React.useState(config.model_providers || {});
+    const [providerModels, setProviderModels] = React.useState(config.provider_models || {});
 
     useEffect(function () {
       setStrategy(config.strategy);
       setAutoSwitch(config.auto_switch);
       setModelPrio(config.model_priority || []);
       setProviderPrio(config.provider_priority || []);
+      setModelProviders(config.model_providers || {});
+      setProviderModels(config.provider_models || {});
     }, [config]);
 
     function save() {
@@ -135,6 +137,8 @@
         auto_switch: autoSwitch,
         model_priority: modelPrio,
         provider_priority: providerPrio,
+        model_providers: strategy === "model_first" ? modelProviders : {},
+        provider_models: strategy === "provider_first" ? providerModels : {},
       });
     }
 
@@ -148,31 +152,209 @@
       return newArr;
     }
 
-      function renderPriorityList(items, setItems) {
+    function moveSubItem(obj, model, idx, dir) {
+      var list = (obj[model] || []).slice();
+      var target = idx + dir;
+      if (target < 0 || target >= list.length) return obj;
+      var tmp = list[target];
+      list[target] = list[idx];
+      list[idx] = tmp;
+      var next = {};
+      Object.keys(obj).forEach(function (k) { next[k] = obj[k]; });
+      next[model] = list;
+      return next;
+    }
+
+    function addSubItem(obj, model, provider) {
+      var list = (obj[model] || []).slice();
+      if (list.indexOf(provider) !== -1) return obj;
+      var next = {};
+      Object.keys(obj).forEach(function (k) { next[k] = obj[k]; });
+      next[model] = list.concat([provider]);
+      return next;
+    }
+
+    function removeSubItem(obj, model, idx) {
+      var list = (obj[model] || []).slice();
+      list.splice(idx, 1);
+      var next = {};
+      Object.keys(obj).forEach(function (k) { next[k] = obj[k]; });
+      next[model] = list;
+      return next;
+    }
+
+    // Collect all known providers from the snapshot
+    function allProviders() {
+      var all = {};
+      if (snapshot) {
+        Object.keys(snapshot).forEach(function (m) { snapshot[m].forEach(function (e) { all[e.provider] = true; }); });
+      }
+      return Object.keys(all).sort();
+    }
+
+    // Provider sub-list for strategy=model_first
+    function renderPerModelProviders(model) {
+      var list = modelProviders[model] || [];
+      var avail = allProviders();
+      var unadded = avail.filter(function (p) { return list.indexOf(p) === -1; });
+
+      return h("div", { style: { marginLeft: "20px", marginTop: "4px", marginBottom: "8px", padding: "6px 8px", backgroundColor: "rgba(86,95,137,0.08)", borderRadius: "4px" } }, [
+        h("div", { style: { fontSize: "11px", color: "#565f89", marginBottom: "4px", fontWeight: 600 } }, "Provider priority for \"" + model + "\":"),
+        list.length === 0
+          ? h("span", { style: { fontSize: "11px", color: "#565f89", fontStyle: "italic" } }, "(falls back to global Provider Priority)")
+          : h("div", { style: { display: "flex", flexDirection: "column", gap: "2px" } },
+              list.map(function (p, pi) {
+                return h("div", { key: p, style: { display: "flex", alignItems: "center", gap: "4px", fontSize: "12px" } }, [
+                  h("span", { style: { flex: 1, color: "#a9b1d6" } }, String(pi + 1) + ". " + p),
+                  h("button", {
+                    onClick: function () { setModelProviders(moveSubItem(modelProviders, model, pi, -1)); },
+                    disabled: pi === 0,
+                    style: { cursor: pi === 0 ? "not-allowed" : "pointer", opacity: pi === 0 ? 0.3 : 1, border: "none", background: "none", color: "#7aa2f7", fontSize: "12px", padding: "0 2px" },
+                  }, "\u25B2"),
+                  h("button", {
+                    onClick: function () { setModelProviders(moveSubItem(modelProviders, model, pi, 1)); },
+                    disabled: pi === list.length - 1,
+                    style: { cursor: pi === list.length - 1 ? "not-allowed" : "pointer", opacity: pi === list.length - 1 ? 0.3 : 1, border: "none", background: "none", color: "#7aa2f7", fontSize: "12px", padding: "0 2px" },
+                  }, "\u25BC"),
+                  h("button", {
+                    onClick: function () { setModelProviders(removeSubItem(modelProviders, model, pi)); },
+                    style: { border: "none", background: "none", color: "#f7768e", cursor: "pointer", fontSize: "12px", padding: "0 2px" },
+                  }, "\u2715"),
+                ]);
+              })
+            ),
+        unadded.length > 0 && h("div", { style: { display: "flex", gap: "4px", marginTop: "4px" } }, [
+          h("select", {
+            id: "psw-add-mp-" + model,
+            style: { flex: 1, fontSize: "11px", padding: "1px 4px", backgroundColor: "#1a1b26", color: "#c0caf5", border: "1px solid #565f89", borderRadius: "4px" },
+          }, [
+            h("option", { value: "", disabled: true, selected: true }, "+ add provider..."),
+            unadded.map(function (p) { return h("option", { value: p }, p); }),
+          ]),
+          h("button", {
+            onClick: function () {
+              var sel = document.getElementById("psw-add-mp-" + model);
+              var val = sel && sel.value;
+              if (val) setModelProviders(addSubItem(modelProviders, model, val));
+            },
+            style: { fontSize: "11px", padding: "1px 6px", cursor: "pointer", backgroundColor: "#7aa2f7", color: "#fff", border: "none", borderRadius: "4px" },
+          }, "Add"),
+        ]),
+      ]);
+    }
+
+    // Model sub-list for strategy=provider_first
+    function renderPerProviderModels(provider) {
+      var list = providerModels[provider] || [];
+      var avail = Object.keys(snapshot || {}).sort();
+      var unadded = avail.filter(function (m) { return list.indexOf(m) === -1; });
+
+      return h("div", { style: { marginLeft: "20px", marginTop: "4px", marginBottom: "8px", padding: "6px 8px", backgroundColor: "rgba(86,95,137,0.08)", borderRadius: "4px" } }, [
+        h("div", { style: { fontSize: "11px", color: "#565f89", marginBottom: "4px", fontWeight: 600 } }, "Model priority for \"" + provider + "\":"),
+        list.length === 0
+          ? h("span", { style: { fontSize: "11px", color: "#565f89", fontStyle: "italic" } }, "(falls back to global Model Priority)")
+          : h("div", { style: { display: "flex", flexDirection: "column", gap: "2px" } },
+              list.map(function (m, mi) {
+                return h("div", { key: m, style: { display: "flex", alignItems: "center", gap: "4px", fontSize: "12px" } }, [
+                  h("span", { style: { flex: 1, color: "#a9b1d6" } }, String(mi + 1) + ". " + m),
+                  h("button", {
+                    onClick: function () { setProviderModels(moveSubItem(providerModels, provider, mi, -1)); },
+                    disabled: mi === 0,
+                    style: { cursor: mi === 0 ? "not-allowed" : "pointer", opacity: mi === 0 ? 0.3 : 1, border: "none", background: "none", color: "#7aa2f7", fontSize: "12px", padding: "0 2px" },
+                  }, "\u25B2"),
+                  h("button", {
+                    onClick: function () { setProviderModels(moveSubItem(providerModels, provider, mi, 1)); },
+                    disabled: mi === list.length - 1,
+                    style: { cursor: mi === list.length - 1 ? "not-allowed" : "pointer", opacity: mi === list.length - 1 ? 0.3 : 1, border: "none", background: "none", color: "#7aa2f7", fontSize: "12px", padding: "0 2px" },
+                  }, "\u25BC"),
+                  h("button", {
+                    onClick: function () { setProviderModels(removeSubItem(providerModels, provider, mi)); },
+                    style: { border: "none", background: "none", color: "#f7768e", cursor: "pointer", fontSize: "12px", padding: "0 2px" },
+                  }, "\u2715"),
+                ]);
+              })
+            ),
+        unadded.length > 0 && h("div", { style: { display: "flex", gap: "4px", marginTop: "4px" } }, [
+          h("select", {
+            id: "psw-add-pm-" + provider,
+            style: { flex: 1, fontSize: "11px", padding: "1px 4px", backgroundColor: "#1a1b26", color: "#c0caf5", border: "1px solid #565f89", borderRadius: "4px" },
+          }, [
+            h("option", { value: "", disabled: true, selected: true }, "+ add model..."),
+            unadded.map(function (m) { return h("option", { value: m }, m); }),
+          ]),
+          h("button", {
+            onClick: function () {
+              var sel = document.getElementById("psw-add-pm-" + provider);
+              var val = sel && sel.value;
+              if (val) setProviderModels(addSubItem(providerModels, provider, val));
+            },
+            style: { fontSize: "11px", padding: "1px 6px", cursor: "pointer", backgroundColor: "#7aa2f7", color: "#fff", border: "none", borderRadius: "4px" },
+          }, "Add"),
+        ]),
+      ]);
+    }
+
+    function renderPriorityList(items, setItems, renderSub) {
       return h("div", { style: { display: "flex", flexDirection: "column", gap: "4px" } },
         items.map(function (item, idx) {
-          return h("div", { key: item, className: "psw-priority-item" }, [
-            h("span", { className: "psw-priority-label" }, item),
-            h("button", {
-              onClick: function () { setItems(moveItem(items, idx, -1)); },
-              disabled: idx === 0,
-              style: { cursor: idx === 0 ? "not-allowed" : "pointer", opacity: idx === 0 ? 0.3 : 1 },
-            }, "\u25B2"),
-            h("button", {
-              onClick: function () { setItems(moveItem(items, idx, 1)); },
-              disabled: idx === items.length - 1,
-              style: { cursor: idx === items.length - 1 ? "not-allowed" : "pointer", opacity: idx === items.length - 1 ? 0.3 : 1 },
-            }, "\u25BC"),
-            h("button", {
-              onClick: function () { setItems(items.filter(function (_, i) { return i !== idx; })); },
-              style: { color: "#f7768e", cursor: "pointer" },
-            }, "\u2715"),
+          return h("div", { key: item }, [
+            h("div", { className: "psw-priority-item" }, [
+              h("span", { className: "psw-priority-label" }, item),
+              h("button", {
+                onClick: function () { setItems(moveItem(items, idx, -1)); },
+                disabled: idx === 0,
+                style: { cursor: idx === 0 ? "not-allowed" : "pointer", opacity: idx === 0 ? 0.3 : 1 },
+              }, "\u25B2"),
+              h("button", {
+                onClick: function () { setItems(moveItem(items, idx, 1)); },
+                disabled: idx === items.length - 1,
+                style: { cursor: idx === items.length - 1 ? "not-allowed" : "pointer", opacity: idx === items.length - 1 ? 0.3 : 1 },
+              }, "\u25BC"),
+              h("button", {
+                onClick: function () { setItems(items.filter(function (_, i) { return i !== idx; })); },
+                style: { color: "#f7768e", cursor: "pointer" },
+              }, "\u2715"),
+            ]),
+            // Per-item sub-list (model_providers or provider_models)
+            renderSub && renderSub(item),
           ]);
         })
       );
     }
 
     return h("div", { className: "psw-config-section" }, [
+      // Current model indicator
+      h("div", {
+        style: {
+          display: "flex", alignItems: "center", gap: "12px",
+          padding: "8px 12px", marginBottom: "12px",
+          background: "rgba(122,162,247,0.06)", borderRadius: "6px",
+          border: "1px solid rgba(122,162,247,0.12)",
+        }
+      }, [
+        h("span", { style: { fontSize: "11px", color: "#565f89", fontWeight: 600 } }, "CURRENT"),
+        h("span", {
+          style: { fontSize: "16px", fontWeight: 700, color: "#9ece6a" }
+        }, activeCombo && activeCombo.model_name ? activeCombo.model_name : "—"),
+        h("span", {
+          style: { fontSize: "12px", color: "#a9b1d6" }
+        }, activeCombo && activeCombo.provider_name ? "@ " + activeCombo.provider_name : ""),
+        h("div", { style: { flex: 1 } }),
+        h("span", {
+          style: {
+            fontSize: "11px", padding: "2px 8px", borderRadius: "10px",
+            background: isAutoEnabled ? "rgba(158,206,106,0.15)" : "rgba(86,95,137,0.2)",
+            color: isAutoEnabled ? "#9ece6a" : "#565f89",
+            fontWeight: 600,
+          }
+        }, isAutoEnabled ? "Auto ✓" : "Auto ✗"),
+        manualOverrideEn &&
+          h("span", {
+            style: { fontSize: "11px", padding: "2px 8px", borderRadius: "10px",
+                     background: "rgba(224,175,104,0.15)", color: "#e0af68", fontWeight: 600 }
+          }, "Manual"),
+      ]),
+
       // Strategy + Toggles
       h("div", { className: "psw-config-toolbar" }, [
         h("div", { style: { display: "flex", alignItems: "center", gap: "6px" } }, [
@@ -193,11 +375,6 @@
           "Auto-switch",
         ]),
         h(Button, {
-          variant: "outline", size: "sm",
-          onClick: function () { onScan(); },
-          disabled: loading,
-        }, loading ? "Scanning..." : "Scan Now"),
-        h(Button, {
           variant: "primary", size: "sm",
           onClick: save,
         }, "Save Config"),
@@ -207,7 +384,7 @@
       h("div", { className: "psw-priority-grid" }, [
         h("div", null, [
           h("div", { className: "psw-priority-title" }, "Model Priority"),
-          renderPriorityList(modelPrio, setModelPrio),
+          renderPriorityList(modelPrio, setModelPrio, strategy === "model_first" ? renderPerModelProviders : null),
           // Add-model dropdown from snapshot
           snapshot && h("div", { style: { display: "flex", gap: "4px", marginTop: "6px" } }, [
             h("select", {
@@ -231,7 +408,7 @@
         ]),
         h("div", null, [
           h("div", { style: { fontSize: "12px", fontWeight: 600, color: "#565f89", marginBottom: "6px" } }, "Provider Priority"),
-          renderPriorityList(providerPrio, setProviderPrio),
+          renderPriorityList(providerPrio, setProviderPrio, strategy === "provider_first" ? renderPerProviderModels : null),
           // Add-provider dropdown from snapshot
           snapshot && h("div", { style: { display: "flex", gap: "4px", marginTop: "6px" } }, [
             h("select", {
@@ -259,42 +436,9 @@
         ]),
       ]),
 
-      // Snapshot Grid
-      snapshot && h("div", null, [
-        h("div", { style: { fontSize: "12px", fontWeight: 600, color: "#565f89", marginBottom: "8px" } }, "Scan Results"),
-        h("div", { className: "psw-table-wrap" },
-          h("table", { className: "psw-table" }, [
-            h("thead", null,
-              h("tr", { style: { borderBottom: "1px solid rgba(86,95,137,0.3)" } }, [
-                h("th", { style: { textAlign: "left", padding: "6px 8px", color: "#565f89", fontWeight: 600 } }, "Model"),
-                h("th", { style: { textAlign: "left", padding: "6px 8px", color: "#565f89", fontWeight: 600 } }, "Provider"),
-                h("th", { style: { textAlign: "left", padding: "6px 8px", color: "#565f89", fontWeight: 600 } }, "Status"),
-              ])
-            ),
-            h("tbody", null,
-              Object.keys(snapshot).sort().map(function (model) {
-                return snapshot[model].map(function (entry, ei) {
-                  return h("tr", {
-                    key: model + "-" + ei,
-                    style: { borderBottom: "1px solid rgba(86,95,137,0.1)" },
-                  }, [
-                    h("td", { style: { padding: "5px 8px", color: "#c0caf5" } }, ei === 0 ? model : ""),
-                    h("td", { style: { padding: "5px 8px", color: "#a9b1d6" } }, entry.provider),
-                    h("td", { style: { padding: "5px 8px" } },
-                      h(StatusBadge, {
-                        status: entry.status,
-                        label: entry.error_reason || entry.status,
-                      })
-                    ),
-                  ]);
-                });
-              })
-            ),
-          ])
-        ),
-      ]),
-    ]);
-  }
+      // Switch History inline (compact)
+    ]);  // end return
+  }  // end ConfigPanel
 
   // -----------------------------------------------------------------------
   // HistoryPanel
@@ -370,9 +514,24 @@
         api("/" + name + "/snapshot"),
         api("/" + name + "/history"),
       ]).then(function (results) {
-        setConfig(results[0].config);
-        setSnapshot(results[1].snapshots);
-        setHistory(results[2].history);
+        // Config: flat response (no .config wrapper)
+        setConfig(results[0]);
+        // Snapshot: flat entries array → group by model ({model: [{provider, status, error_reason}, ...]})
+        var grouped = {};
+        if (results[1] && results[1].entries) {
+          results[1].entries.forEach(function (e) {
+            if (!grouped[e.model]) grouped[e.model] = [];
+            grouped[e.model].push({
+              provider: e.provider,
+              status: e.status,
+              last_available_at: e.last_available_at,
+              error_reason: e.error_reason,
+            });
+          });
+        }
+        setSnapshot(grouped);
+        // History: .entries array
+        setHistory(results[2] && results[2].entries ? results[2].entries : []);
       }).catch(function (err) {
         console.error("Failed to load profile data:", err);
       }).finally(function () {
@@ -389,8 +548,9 @@
       api("/" + name + "/config", {
         method: "PUT",
         body: JSON.stringify(updates),
-      }).then(function (result) {
-        setConfig(result.config);
+      }).then(function () {
+        // Reload full profile data to refresh config state
+        api("/" + name + "/config").then(function (c) { setConfig(c); });
         loadProfiles();
       });
     }
@@ -489,9 +649,11 @@
               profile: selected,
               config: config,
               snapshot: snapshot,
+              activeCombo: selectedProfile ? selectedProfile.active_combo : null,
+              manualOverrideEn: isOverridden,
+              isAutoEnabled: isAutoEnabled,
               loading: loading,
               onUpdate: function (updates) { updateConfig(selected, updates); },
-              onScan: function () { scanProfile(selected); },
             }),
           ]),
 

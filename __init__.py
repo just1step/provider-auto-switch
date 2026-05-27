@@ -93,6 +93,19 @@ def _resolve_profile(session_id: str, task_id: str, provider: str) -> str | None
         import os
         import yaml
         hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+
+        def _check_profile(cfg: dict) -> bool:
+            """Check if a profile's config references this provider."""
+            # Check model.provider
+            m = cfg.get("model", {})
+            if isinstance(m, dict) and m.get("provider") == provider:
+                return True
+            # Check custom_providers entries
+            for cp in cfg.get("custom_providers", []):
+                if isinstance(cp, dict) and cp.get("name") == provider:
+                    return True
+            return False
+
         profiles_dir = hermes_home / "profiles"
         if profiles_dir.is_dir():
             for d in sorted(profiles_dir.iterdir()):
@@ -100,17 +113,15 @@ def _resolve_profile(session_id: str, task_id: str, provider: str) -> str | None
                 if cfg_path.exists():
                     with open(cfg_path) as f:
                         cfg = yaml.safe_load(f) or {}
-                    m = cfg.get("model", {})
-                    if isinstance(m, dict) and m.get("provider") == provider:
+                    if _check_profile(cfg):
                         return d.name
-            # Check default
-            default_cfg = hermes_home / "config.yaml"
-            if default_cfg.exists():
-                with open(default_cfg) as f:
-                    cfg = yaml.safe_load(f) or {}
-                m = cfg.get("model", {})
-                if isinstance(m, dict) and m.get("provider") == provider:
-                    return "default"
+        # Check default
+        default_cfg = hermes_home / "config.yaml"
+        if default_cfg.exists():
+            with open(default_cfg) as f:
+                cfg = yaml.safe_load(f) or {}
+            if _check_profile(cfg):
+                return "default"
     except Exception:
         pass
 
