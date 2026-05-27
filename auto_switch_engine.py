@@ -16,7 +16,7 @@ from typing import Any, Optional
 import yaml
 import requests
 
-from .db import (
+from auto_switch_db import (
     ScanSnapshot, SwitchConfig, SwitchHistory,
     upsert_snapshot, clear_snapshots, get_snapshots,
     get_config, upsert_config, get_active_combo, set_active_combo,

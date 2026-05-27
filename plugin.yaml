@@ -1,0 +1,7 @@
+name: provider-auto-switch
+version: 1.0.0
+description: "Automatic model switching across Hermes profiles — detects API errors via post_api_request hook, applies model-first or provider-first switch strategies, provides Dashboard UI for configuration and monitoring."
+author: "Just1Step"
+kind: standalone
+hooks:
+  - post_api_request

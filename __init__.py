@@ -18,7 +18,7 @@ _plugin_root = Path(__file__).resolve().parent
 if str(_plugin_root) not in sys.path:
     sys.path.insert(0, str(_plugin_root))
 
-from db import init_db
+from auto_switch_db import init_db
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ def _resolve_profile(session_id: str, task_id: str, provider: str) -> str | None
 def _handle_error(profile_name: str, provider: str, model: str, error_str: str) -> None:
     """Synchronous error handler — runs in executor thread."""
     try:
-        from switch_engine import handle_api_error
+        from auto_switch_engine import handle_api_error
         result = handle_api_error(profile_name, provider, model, error_str)
         if result and result.get("success"):
             log.info("Auto-switched %s due to error: %s", profile_name, error_str)

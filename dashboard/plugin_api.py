@@ -20,13 +20,13 @@ _plugin_root = Path(__file__).resolve().parent.parent
 if str(_plugin_root) not in sys.path:
     sys.path.insert(0, str(_plugin_root))
 
-from db import (
+from auto_switch_db import (
     SwitchConfig, ScanSnapshot, SwitchHistory,
     get_config, upsert_config, get_active_combo,
     get_snapshots, get_history, init_db,
     get_all_configs, list_profiles_from_config,
 )
-from switch_engine import (
+from auto_switch_engine import (
     scan_provider_models, auto_switch, execute_switch, check_recovery,
 )
 
@@ -77,7 +77,7 @@ async def get_profile_config(profile: str):
     cfg = get_config(profile)
     if not cfg:
         from dataclasses import asdict
-        from ..db import SwitchConfig as SC
+        from auto_switch_db import SwitchConfig as SC
         cfg = SC(profile_name=profile)
         upsert_config(cfg)
     from dataclasses import asdict
@@ -89,7 +89,7 @@ async def update_profile_config(profile: str, update: ConfigUpdate):
     """Update the switch config for a profile."""
     cfg = get_config(profile)
     from dataclasses import asdict
-    from ..db import SwitchConfig as SC
+    from auto_switch_db import SwitchConfig as SC
     if not cfg:
         cfg = SC(profile_name=profile)
 
@@ -133,7 +133,7 @@ async def manual_switch(profile: str, req: ManualSwitch):
     """Manually switch a profile to a specific model+provider."""
     # Manual switch sets manual_override flag
     cfg = get_config(profile)
-    from ..db import SwitchConfig as SC
+    from auto_switch_db import SwitchConfig as SC
     if not cfg:
         cfg = SC(profile_name=profile)
     cfg.manual_override = True
