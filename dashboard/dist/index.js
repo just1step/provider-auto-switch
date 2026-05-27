@@ -208,10 +208,54 @@
         h("div", null, [
           h("div", { className: "psw-priority-title" }, "Model Priority"),
           renderPriorityList(modelPrio, setModelPrio),
+          // Add-model dropdown from snapshot
+          snapshot && h("div", { style: { display: "flex", gap: "4px", marginTop: "6px" } }, [
+            h("select", {
+              id: "psw-add-model-" + profile,
+              style: { flex: 1, fontSize: "12px", padding: "2px 4px", backgroundColor: "#1a1b26", color: "#c0caf5", border: "1px solid #565f89", borderRadius: "4px" },
+            }, [
+              h("option", { value: "", disabled: true, selected: true }, "+ add model..."),
+              Object.keys(snapshot).sort().filter(function (m) { return modelPrio.indexOf(m) === -1; }).map(function (m) {
+                return h("option", { value: m }, m);
+              }),
+            ]),
+            h("button", {
+              onClick: function () {
+                var sel = document.getElementById("psw-add-model-" + profile);
+                var val = sel && sel.value;
+                if (val && modelPrio.indexOf(val) === -1) setModelPrio(modelPrio.concat([val]));
+              },
+              style: { fontSize: "12px", padding: "2px 8px", cursor: "pointer", backgroundColor: "#7aa2f7", color: "#fff", border: "none", borderRadius: "4px" },
+            }, "Add"),
+          ]),
         ]),
         h("div", null, [
           h("div", { style: { fontSize: "12px", fontWeight: 600, color: "#565f89", marginBottom: "6px" } }, "Provider Priority"),
           renderPriorityList(providerPrio, setProviderPrio),
+          // Add-provider dropdown from snapshot
+          snapshot && h("div", { style: { display: "flex", gap: "4px", marginTop: "6px" } }, [
+            h("select", {
+              id: "psw-add-prov-" + profile,
+              style: { flex: 1, fontSize: "12px", padding: "2px 4px", backgroundColor: "#1a1b26", color: "#c0caf5", border: "1px solid #565f89", borderRadius: "4px" },
+            }, [
+              h("option", { value: "", disabled: true, selected: true }, "+ add provider..."),
+              (function () {
+                var all = {};
+                Object.keys(snapshot).forEach(function (m) { snapshot[m].forEach(function (e) { all[e.provider] = true; }); });
+                return Object.keys(all).sort().filter(function (p) { return providerPrio.indexOf(p) === -1; }).map(function (p) {
+                  return h("option", { value: p }, p);
+                });
+              })(),
+            ]),
+            h("button", {
+              onClick: function () {
+                var sel = document.getElementById("psw-add-prov-" + profile);
+                var val = sel && sel.value;
+                if (val && providerPrio.indexOf(val) === -1) setProviderPrio(providerPrio.concat([val]));
+              },
+              style: { fontSize: "12px", padding: "2px 8px", cursor: "pointer", backgroundColor: "#7aa2f7", color: "#fff", border: "none", borderRadius: "4px" },
+            }, "Add"),
+          ]),
         ]),
       ]),
 

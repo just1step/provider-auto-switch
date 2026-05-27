@@ -283,15 +283,24 @@ def get_history(profile_name: str, limit: int = 50) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def list_profiles_from_config() -> list[str]:
-    """Discover profile names from ~/.hermes/profiles/ directory."""
+    """Discover profile names from ~/.hermes/profiles/ directory + root config.yaml."""
     hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    profiles = []
+    
+    # Always include "default" if root config.yaml exists
+    default_cfg = hermes_home / "config.yaml"
+    if default_cfg.exists():
+        profiles.append("default")
+    
+    # Scan profiles/ subdirectory
     profiles_dir = hermes_home / "profiles"
-    if not profiles_dir.is_dir():
-        return []
-    return sorted(
-        d.name for d in profiles_dir.iterdir()
-        if d.is_dir() and (d / "config.yaml").exists()
-    )
+    if profiles_dir.is_dir():
+        profiles.extend(
+            d.name for d in sorted(profiles_dir.iterdir())
+            if d.is_dir() and (d / "config.yaml").exists()
+        )
+    
+    return profiles
 
 
 def get_all_configs() -> list[dict]:

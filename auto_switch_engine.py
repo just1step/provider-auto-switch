@@ -324,10 +324,7 @@ def auto_switch(profile_name: str, reason: str = "auto", triggered_by: str = "au
         log.info("Skip auto-switch for %s: auto-switch disabled", profile_name)
         return {"success": False, "reason": "auto_switch_disabled"}
 
-    # Scan providers first to get current state
-    scan_provider_models(profile_name)
-
-    # Find the best combo
+    # Use existing snapshot data — don't call any provider API (zero token cost)
     combo = _find_next_combo(profile_name, cfg)
     if not combo:
         log.warning("No available combo for %s", profile_name)
