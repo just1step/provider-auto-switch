@@ -36,12 +36,21 @@
   // API helpers
   // -----------------------------------------------------------------------
   const BASE = "/api/plugins/provider-auto-switch";
+  const TOKEN = window.__HERMES_SESSION_TOKEN__ || "";
 
   async function api(path, opts) {
     const res = await fetch(BASE + path, {
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Hermes-Session-Token": TOKEN,
+      },
       ...opts,
     });
+    if (!res.ok) {
+      const body = await res.text().catch(function () { return ""; });
+      console.error("API error", res.status, path, body.slice(0, 200));
+      throw new Error("API " + res.status + " " + path);
+    }
     return res.json();
   }
 
