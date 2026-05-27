@@ -1,0 +1,14 @@
+{
+  "name": "provider-auto-switch",
+  "label": "Auto-Switch",
+  "description": "Automatic model switching across profiles — manage switch strategies, priority rankings, and manual overrides. Detects API errors, handles rate limits, and recovers when models become available again.",
+  "icon": "Shuffle",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/auto-switch",
+    "position": "after:skills"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
