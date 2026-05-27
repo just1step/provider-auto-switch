@@ -19,8 +19,7 @@
     Card, CardContent, CardHeader, CardTitle,
     Badge, Button, Input, Label, Select, SelectOption,
   } = SDK.components;
-  const { useState, useEffect, useCallback, useMemo } = SDK.hooks;
-  const { cn } = SDK.utils;
+  const { useState, useEffect } = SDK.hooks;
 
   // -----------------------------------------------------------------------
   // Colors
@@ -33,25 +32,22 @@
   };
 
   // -----------------------------------------------------------------------
-  // API helpers
+  // API helpers — follow achievements plugin pattern
   // -----------------------------------------------------------------------
   const BASE = "/api/plugins/provider-auto-switch";
-  const TOKEN = window.__HERMES_SESSION_TOKEN__ || "";
 
-  async function api(path, opts) {
-    const res = await fetch(BASE + path, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Hermes-Session-Token": TOKEN,
-      },
-      ...opts,
-    });
+  async function api(path, options) {
+    const url = BASE + path;
+    const token = window.__HERMES_SESSION_TOKEN__ || "";
+    const headers = { ...((options && options.headers) || {}) };
+    if (token) headers["X-Hermes-Session-Token"] = token;
+    const res = await fetch(url, { ...(options || {}), headers });
     if (!res.ok) {
-      const body = await res.text().catch(function () { return ""; });
-      console.error("API error", res.status, path, body.slice(0, 200));
-      throw new Error("API " + res.status + " " + path);
+      const text = await res.text().catch(function () { return res.statusText; });
+      throw new Error(res.status + ": " + text);
     }
-    return res.json();
+    const text = await res.text();
+    try { return JSON.parse(text); } catch (_) { return null; }
   }
 
   // -----------------------------------------------------------------------
